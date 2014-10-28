@@ -1,4 +1,9 @@
 //#define _POSIX_C_SOURCE 200809L
+//
+
+#define _GNU_SOURCE
+ #include <errno.h>
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -6,7 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <assert.h>
-#include <numa.h>
+//#include <numa.h>
 #include <time.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -16,13 +21,14 @@
 #define BUGFIX
 
 #define MAX_ENTRIES 100*1024*1024
-#define OBJECT_TRACK_SZ 1024*1024*10
+#define OBJECT_TRACK_SZ 1024*64
 #define MAXPAGELISTSZ 1024*1024*100
 #define NODE_TO_MIGRATE 1
-#define MIGRATEFREQ 1
+#define MIGRATEFREQ 2
 //#define HINT_MIGRATION
 
-#define __NR_move_inactpages 316
+#define __NR_move_inactpages 317
+#define __NR_NValloc 316
 
 static int init_alloc;
 static unsigned int alloc_cnt;
@@ -71,13 +77,6 @@ int migrate_now(){
 
 
 
-void *get_alloc_pagemap(unsigned int *count, size_t **ptr){
-
-    *count = offset;
-    *ptr= chunk_sz;
-    return (void *)chunk_addr;
-}
-
 
 void call_migrate_func()
 {
@@ -88,11 +87,46 @@ void call_migrate_func()
 }
 
 
+  #define handle_error_en(en, msg) \
+		do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
+
+   int  setaff(int aff)
+   {
+	   int s, j;
+	   cpu_set_t cpuset;
+	   pthread_t thread;
+
+		j=aff;
+
+	   thread = pthread_self();
+
+	   /* Set affinity mask to include CPUs 0 to 7 */
+	   CPU_ZERO(&cpuset);
+	   CPU_SET(j, &cpuset);
+
+	   s = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+	   if (s != 0)
+		   handle_error_en(s, "pthread_setaffinity_np");
+
+	   /* Check the actual affinity mask assigned to the thread */
+	   s = pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+	   if (s != 0)
+		   handle_error_en(s, "pthread_getaffinity_np");
+
+	   printf("Set returned by pthread_getaffinity_np() contained:\n");
+	   if (CPU_ISSET(j, &cpuset))
+		   printf("    CPU %d\n", j);
+
+	   //exit(EXIT_SUCCESS);
+	   return 0;
+   }
+
 
 
 void * entry_point(void *arg)
 {
     printf("starting thread\n");
+	setaff(3);
     call_migrate_func();
     printf("exiting thread\n");
     return NULL;
@@ -100,27 +134,6 @@ void * entry_point(void *arg)
 
 void init_allocs() {
 
-	//pthread_mutex_lock(&mutex);
-
-    chunk_addr =(unsigned long *)mmap (0, sizeof(unsigned long) * MAX_ENTRIES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    chunk_sz = (size_t *)mmap (0, sizeof(size_t) * MAX_ENTRIES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    chunk_mig_status = (int *)mmap (0, sizeof(int) * MAX_ENTRIES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	migpagelist = (void **)mmap (0, MAXPAGELISTSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-	if(!chunk_addr) {
-		//pthread_mutex_unlock(&mutex);
-	    assert(chunk_addr);
-	}
-
-	if(!chunk_sz) {
-		//pthread_mutex_unlock(&mutex);
-	    assert(chunk_sz);
-	}
-
-	if(!chunk_mig_status) {
-		//pthread_mutex_unlock(&mutex);
-		assert(chunk_mig_status);
-	}
 
 	if(pthread_create(&thr, NULL, &entry_point, NULL))
     {
@@ -140,32 +153,16 @@ int record_addr(void* addr, size_t size) {
 	return 0;
 #endif
 
-	if(size < OBJECT_TRACK_SZ)
-		return -1;
-
-	//pthread_mutex_lock(&largemutex);
-
-	if(init_alloc) return;	
-
     if(!init_alloc){
 		pthread_mutex_lock(&largemutex);
         init_allocs();
 		pthread_mutex_unlock(&largemutex);
     }
 
-//#ifdef _DEBUG
-	fprintf(stderr,"migration: Recording allocation %zu\n", size);
-//#endif
-    if(size >= OBJECT_TRACK_SZ) {
-        chunk_addr[offset]=(unsigned long)addr;
-        chunk_sz[offset]=size;
-		chunk_mig_status[offset]=0;
-        offset++;
-        alloc_cnt++;
-		stat_allocsz += size;
-    }
+#if 1
+	return 0;
+#endif
 
-    return 0;
 }
 
 
@@ -283,18 +280,8 @@ int migrate_fn() {
 
 	int nr_nodes=0, rc=-1;	
 	int cnt=0;
+	int migret=0;	
 
-   if(!init_numa) {
-        //numa_init();
-        nr_nodes = numa_max_node()+1;
-        //printf("print migrate pages %d\n",nr_nodes);
-        old_nodes = numa_bitmask_alloc(nr_nodes);
-        new_nodes = numa_bitmask_alloc(nr_nodes);
-        numa_bitmask_setbit(old_nodes, 0);
-        numa_bitmask_setbit(new_nodes, 1);
-        init_numa = 1;
-    }
-	//printf("Migrating pages\n");
 
 #ifndef _STOPMIGRATION
 
@@ -313,133 +300,63 @@ int migrate_fn() {
 		exit(-1);
     }*/
 
-  	for(cnt=0; cnt < alloc_cnt; cnt++) {
+  	/*for(cnt=0; cnt < alloc_cnt; cnt++) {
 
-		(unsigned long) syscall(__NR_move_inactpages,
+		//fprintf(stdout,"calling migrate system call function \n");
+		migret =(unsigned long) syscall(__NR_move_inactpages,
 								(unsigned long)chunk_addr[cnt],
 								(unsigned long)chunk_sz[cnt]);
-	  }
+
+		//fprintf(stdout,"total migrated pages %d\n",migret);
+		//if(migret){ 
+			//(char *) syscall(__NR_NValloc, 10);		
+		//}
+	  }*/
+
+	migret =(unsigned long) syscall(__NR_move_inactpages,
+								(unsigned long)999999999999,
+								(unsigned long)100);
+
+	//call to get the the stats
+	migret =(unsigned long) syscall(__NR_move_inactpages,
+								(unsigned long)999999999999,
+								0);
+	printf("TOTAL MIGRATED PAGES %u \n", migret);
+
+
 #endif
 	return 0;
 
 }
 
+int firsttime=1;
 
 void migrate_pages(int node) {
 
-	unsigned int pgcount=0, migcnt=0;
-	int *status;
-	int *nodes;
-	int i =0, rc=0;
 	struct timespec currspec;
 	int sec;
-	int nr_nodes = 2; //numa_max_node()+1;
-	size_t *sizearr = NULL;
 
+	fprintf(stdout,"calling migrate_pages \n");
 
 	clock_gettime(CLOCK_REALTIME, &currspec);
 
-	if((currspec.tv_sec - spec.tv_sec) < MIGRATEFREQ)
+	unsigned int diff = currspec.tv_sec - spec.tv_sec;
+
+	if(firsttime) {
+		firsttime = 0;
+		goto migrate;
+	}
+	if(diff < MIGRATEFREQ) 
 		goto gettime; 
 
-#ifndef BUGFIX
-	void *memptr=NULL;
-
-	//pthread_mutex_lock(&mutex);
-	memptr = get_alloc_pagemap(&pgcount, &sizearr);
-	if(!pgcount) {
-		//assert(pgcount);
-		fprintf(stderr,"No pages yet... \n");
-		return; 
-	}
-
-	get_pages((unsigned long*)memptr, sizearr,  pgcount, &migcnt);
-
-#ifdef _DEBUG
-	printf("migcnt %d \n",migcnt);
-#endif
-
-	pgcount = migcnt;
-
-	if(!pgcount)
-		 goto gettime;
-
-	status =(int *)mmap (0, sizeof(int) * pgcount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	nodes =	(int *)mmap (0, sizeof(int) * pgcount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-	assert(migpagelist);
-	assert(status);
-	assert(nodes);
-
-	node = 1;
-	for (i = 0; i < pgcount; i++) {
-         nodes[i] = node;
-         status[i] = -123;
-     }
-#endif
-
-	//fprintf(stdout,"migrate_pages(), pagecount %u\n", pgcount);
-
-	 /* Move to node zero */
-#ifndef BUGFIX
-	numa_move_pages(0, migcnt, migpagelist, nodes, status, 0);
-	//pages already migrated to be removed from list
-	clear_migrated_pages(status, migcnt);
-	munmap(status,sizeof(int) * pgcount);
-	munmap(nodes,sizeof(int) * pgcount);
-	//munmap(migpagelist,MAXPAGELISTSZ);
-	clock_gettime(CLOCK_REALTIME, &spec);
-	//pthread_mutex_unlock(&mutex);
-
-#else
-
+migrate:
 	migrate_fn();
 	clock_gettime(CLOCK_REALTIME, &spec);
 
-#endif
-	return;
-
 gettime:
-	//clock_gettime(CLOCK_REALTIME, &spec);
-	//pthread_mutex_unlock(&mutex);
+	printf("sleeping %u %u %u\n",MIGRATEFREQ, diff, MIGRATEFREQ - diff);
+	sleep(MIGRATEFREQ);
 	return;
-
-
-
-#if 0
-	clock_gettime(CLOCK_REALTIME, &currspec);
-
-	if((currspec.tv_sec - spec.tv_sec) < 1)
-		goto gettime;
-
-	addr = MmapWrapper::get_app_page_list(&pgcount);
-	assert(pgcount);
-
-	pthread_mutex_lock(&mutex);
-
-	status =(int *)mmap (0, sizeof(int) * pgcount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	nodes =	(int *)mmap (0, sizeof(int) * pgcount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	assert(status);
-	assert(nodes);
-	for (i = 0; i < pgcount; i++) {
-            nodes[i] = node;
-            status[i] = -123;
-     }
-
-	//fprintf(stdout,"migrate_off %u pgcount %u\n", migrate_off,pgcount);
-
-	 /* Move to node zero */
-	numa_move_pages(0, pgcount, addr, nodes, status, 0);
-	//fprintf(stdout,"migrated pages %u \n", migrate_off);
-	clock_gettime(CLOCK_REALTIME, &spec);
-	migrate_off += pgcount;
-	munmap(status,sizeof(int) * pgcount);
-	munmap(nodes,sizeof(int) * pgcount);
-	pthread_mutex_unlock(&mutex);
-
-gettime:
-	;
-#endif
 }
 #endif
 
